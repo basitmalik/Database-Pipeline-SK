@@ -1,0 +1,92 @@
+name: DB Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      table:
+        description: "Table to roll back (leave empty = table from the DDL file)"
+        required: false
+        default: ""
+      backup:
+        description: "Backup snapshot to restore (e.g. bak_employees_42) or 'latest'"
+        required: false
+        default: "latest"
+
+concurrency:
+  group: db-pipeline
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DDL_FILE: sql/01_create_table.sql
+  PG_CONTAINER: ${{ vars.PG_CONTAINER }}
+  DB_NAME: ${{ vars.DB_NAME }}
+  DB_USER: ${{ secrets.DB_USER }}
+  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
+jobs:
+  rollback:
+    name: "Restore table from snapshot"
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Resolve target table
+        id: target
+        run: |
+          TABLE="${{ github.event.inputs.table }}"
+          if [[ -z "$TABLE" ]]; then
+            TABLE=$(./scripts/extract_tables.sh ddl "$DDL_FILE" | head -1)
+          fi
+          if [[ -z "$TABLE" ]]; then
+            echo "::error::No table specified and none found in $DDL_FILE"
+            exit 1
+          fi
+          echo "table=$TABLE" >> "$GITHUB_OUTPUT"
+
+      - name: List available snapshots
+        run: |
+          source scripts/db_exec.sh
+          T=$(echo "${{ steps.target.outputs.table }}" | tr '[:upper:]' '[:lower:]')
+          echo "Available snapshots for $T:"
+          run_scalar "SELECT COALESCE(string_agg(table_name, E'\n'), '(none)')
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name ~ ('^bak_' || '${T}' || '_[0-9]+\$');" | tee snapshots.log
+
+      - name: Restore table
+        run: |
+          ./scripts/rollback_table.sh \
+            "${{ steps.target.outputs.table }}" \
+            "${{ github.event.inputs.backup }}" 2>&1 | tee rollback.log
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## ⏪ DB Rollback"
+            echo ""
+            echo "- Table: \`${{ steps.target.outputs.table }}\`"
+            echo "- Snapshot requested: \`${{ github.event.inputs.backup }}\`"
+            echo ""
+            echo '```'
+            cat rollback.log 2>/dev/null || echo "no rollback log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload rollback logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-logs-run-${{ github.run_number }}
+          path: |
+            rollback.log
+            snapshots.log
+          if-no-files-found: ignore
+          retention-days: 30

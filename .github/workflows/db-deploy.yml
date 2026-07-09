@@ -1,0 +1,145 @@
+name: DB Deploy
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "sql/**"
+  workflow_dispatch:
+
+# Never let two jobs touch the DB at the same time
+concurrency:
+  group: db-pipeline
+  cancel-in-progress: false
+
+# Explicit bash => runs with -eo pipefail, so a failing script can't be
+# masked by a trailing `| tee` (GitHub's default shell has NO pipefail)
+defaults:
+  run:
+    shell: bash
+
+env:
+  # >>> Adjust these two paths if your SQL files are named differently <<<
+  DDL_FILE: sql/01_create_table.sql
+  DML_FILE: sql/02_dml.sql
+
+  PG_CONTAINER: ${{ vars.PG_CONTAINER }}   # e.g. pg-db
+  DB_NAME: ${{ vars.DB_NAME }}             # e.g. appdb
+  DB_USER: ${{ secrets.DB_USER }}
+  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+  BACKUP_KEEP: "5"
+
+jobs:
+  # ------------------------------------------------------------------
+  # STAGE 1 - Guard: block DELETE / TRUNCATE before anything touches DB
+  # ------------------------------------------------------------------
+  guard:
+    name: "Guard: forbid DELETE/TRUNCATE"
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan DML file for forbidden statements
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/check_forbidden.sh "$DML_FILE" | tee guard.log
+
+      - name: Guard summary
+        if: always()
+        run: |
+          {
+            echo "## 🛡️ Guard check"
+            echo '```'
+            cat guard.log 2>/dev/null || echo "guard did not produce a log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload guard log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guard-log
+          path: guard.log
+
+  # ------------------------------------------------------------------
+  # STAGE 2 - Deploy: create table if missing, otherwise backup + DML
+  # ------------------------------------------------------------------
+  deploy:
+    name: "Deploy to PostgreSQL"
+    needs: guard
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Detect target table and check existence
+        id: detect
+        run: |
+          source scripts/db_exec.sh
+          TABLE=$(./scripts/extract_tables.sh ddl "$DDL_FILE" | head -1)
+          if [[ -z "$TABLE" ]]; then
+            echo "::error::Could not find CREATE TABLE statement in $DDL_FILE"
+            exit 1
+          fi
+          EXISTS=$(table_exists "$TABLE")
+          echo "Target table: $TABLE | exists in DB: $EXISTS"
+          echo "table=$TABLE"   >> "$GITHUB_OUTPUT"
+          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
+
+      # ---- Branch A: table does NOT exist -> run DDL (file 1) ----
+      - name: "Run DDL (table does not exist)"
+        if: steps.detect.outputs.exists == '0'
+        run: |
+          source scripts/db_exec.sh
+          echo ">> Table ${{ steps.detect.outputs.table }} not found - running $DDL_FILE"
+          run_file "$DDL_FILE" 2>&1 | tee deploy.log
+
+      # ---- Branch B: table EXISTS -> snapshot, then run DML (file 2) ----
+      - name: "Backup snapshot before DML"
+        id: backup
+        if: steps.detect.outputs.exists == '1'
+        run: |
+          ./scripts/backup_table.sh \
+            "${{ steps.detect.outputs.table }}" \
+            "${{ github.run_number }}" 2>&1 | tee backup.log
+          grep '^backup_name=' backup.log >> "$GITHUB_OUTPUT"
+
+      - name: "Run DML (table exists)"
+        if: steps.detect.outputs.exists == '1'
+        run: |
+          source scripts/db_exec.sh
+          echo ">> Table ${{ steps.detect.outputs.table }} exists - running $DML_FILE"
+          run_file "$DML_FILE" 2>&1 | tee deploy.log
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## 🚀 DB Deploy — run #${{ github.run_number }}"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Target table | \`${{ steps.detect.outputs.table }}\` |"
+            echo "| Table existed | ${{ steps.detect.outputs.exists == '1' && 'yes → ran DML' || 'no → ran DDL' }} |"
+            echo "| Backup snapshot | \`${{ steps.backup.outputs.backup_name || 'n/a (DDL run)' }}\` |"
+            echo ""
+            echo "<details><summary>SQL output</summary>"
+            echo ""
+            echo '```'
+            cat deploy.log 2>/dev/null || echo "no deploy log"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deploy logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-logs-run-${{ github.run_number }}
+          path: |
+            deploy.log
+            backup.log
+          if-no-files-found: ignore
+          retention-days: 30
