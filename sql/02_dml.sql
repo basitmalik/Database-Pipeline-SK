@@ -3,7 +3,8 @@
 
 INSERT INTO employees (emp_name, department, salary)
 VALUES ('Ali Khan', 'Engineering', 150000),
-       ('Sara Ahmed', 'Marketing', 95000);
+       ('Sara Ahmed', 'Marketing', 95000),
+       ('Usman Tariq', 'Engineering', 120000);
 
 UPDATE employees
 SET salary = salary * 1.10
