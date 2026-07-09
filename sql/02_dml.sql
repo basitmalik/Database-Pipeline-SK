@@ -9,5 +9,3 @@ VALUES ('Ali Khan', 'Engineering', 150000),
 UPDATE employees
 SET salary = salary * 1.10
 WHERE department = 'Engineering';
-
-DELETE FROM employees WHERE department = 'Marketing';
