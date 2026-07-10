@@ -1,7 +1,7 @@
 -- File 2: DML - INSERT / UPDATE only (runs only when the table exists)
 -- DELETE and TRUNCATE are blocked by the pipeline guard.
 
-INSERT INTO employees (emp_name, department, salary)
+INSERT INTO employees_xsw (emp_name, department, salary)
 VALUES ('Ali Khan', 'Engineering', 150000),
        ('Sara Ahmed', 'Marketing', 95000),
        ('Usman Tariq', 'Engineering', 120000),
